@@ -18,6 +18,7 @@ import android.widget.TextView
 import com.holos.tts.HolosLiteRt
 import org.json.JSONObject
 import java.io.File
+import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
 import java.util.concurrent.Executors
@@ -103,9 +104,16 @@ class MainActivity : Activity() {
         val json = JSONObject(manifest.readText())
         val files = listOf("encoder", "prosody", "decoder", "embeddings", "voices")
             .map { json.getJSONObject(it).getString("file") }
+        // The bundle needs roughly 300 MB free; say so plainly instead of
+        // failing halfway through a download with a cryptic error.
+        val freeMb = bundle.usableSpace / 1_000_000
+        if (freeMb < 400) {
+            throw IllegalStateException(
+                "Not enough free space: $freeMb MB free, the model needs ~300 MB")
+        }
         for ((index, name) in files.withIndex()) {
             val file = File(bundle, name)
-            if (!file.exists()) {
+            if (!file.exists() || file.length() == 0L) {
                 show("Downloading $name (${index + 1}/${files.size})…")
                 fetch(name, file)
             }
@@ -114,10 +122,62 @@ class MainActivity : Activity() {
 
     private fun fetch(name: String, target: File) {
         val partial = File(target.path + ".part")
-        URL(REPOSITORY + name).openStream().use { input ->
-            partial.outputStream().use { output -> input.copyTo(output, 1 shl 20) }
+        if (partial.exists()) partial.delete()
+        var downloaded = 0L
+        try {
+            val connection = URL(REPOSITORY + name).openConnection() as HttpURLConnection
+            connection.connectTimeout = 30_000
+            connection.readTimeout = 60_000
+            connection.connect()
+            check(connection.responseCode == HttpURLConnection.HTTP_OK) {
+                "Download $name failed: HTTP ${connection.responseCode}"
+            }
+            val total = connection.contentLengthLong
+            connection.inputStream.use { input ->
+                partial.outputStream().use { output ->
+                    val buffer = ByteArray(1 shl 20)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        output.write(buffer, 0, read)
+                        downloaded += read
+                    }
+                }
+            }
+            show("Downloaded $name: ${downloaded / 1_000_000} MB" +
+                if (total > 0) " of ${total / 1_000_000} MB" else "")
+            if (total > 0) check(downloaded == total) {
+                "Download $name incomplete: $downloaded of $total bytes"
+            }
+            check(downloaded > 0) { "Download $name is empty" }
+        } catch (e: Exception) {
+            partial.delete()
+            throw e
         }
-        check(partial.renameTo(target)) { "Cannot write $target" }
+        if (target.exists() && !target.delete()) {
+            throw IllegalStateException("Cannot replace old $target")
+        }
+        if (!partial.renameTo(target)) {
+            // File.renameTo() fails on some devices even in the same
+            // directory; fall back to a plain copy instead of giving up.
+            try {
+                partial.inputStream().use { input ->
+                    target.outputStream().use { output ->
+                        input.copyTo(output, 1 shl 20)
+                    }
+                }
+            } catch (e: Exception) {
+                target.delete()
+                throw IllegalStateException(
+                    "Cannot write $target: ${e.message}", e)
+            }
+            partial.delete()
+        }
+        check(target.exists() && target.length() == downloaded) {
+            "Cannot write $target (have " +
+                "${if (target.exists()) target.length() else "no file"}" +
+                " of $downloaded bytes)"
+        }
     }
 
     private fun speak() {
