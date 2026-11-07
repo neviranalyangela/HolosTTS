@@ -1,0 +1,28 @@
+name: Publish HolosTTS LiteRT model bundle
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bundle-artifact.yml'
+  workflow_dispatch:
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download LiteRT bundle from Hugging Face
+        run: |
+          mkdir -p litert
+          cd litert
+          for f in holos_litert.json encoder.tflite prosody.tflite decoder.tflite embeddings.bin voices.bin; do
+            curl -sL --retry 2 -o "$f" "https://huggingface.co/patriotyk/HolosTTS/resolve/main/litert/$f"
+          done
+          ls -lh
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: holos-litert-bundle
+          path: litert/
+          if-no-files-found: error
