@@ -37,6 +37,8 @@ class MainActivity : Activity() {
     private lateinit var voices: Spinner
     private lateinit var speak: Button
     private var tts: HolosLiteRt? = null
+    private var bundleDir: File? = null
+    private var cpuFallback = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -78,6 +80,7 @@ class MainActivity : Activity() {
     private fun load() {
         try {
             val bundle = File(getExternalFilesDir(null), "litert")
+            bundleDir = bundle
             download(bundle)
             show("Loading the models; the first start compiles them for the GPU…")
             val start = System.nanoTime()
@@ -181,53 +184,81 @@ class MainActivity : Activity() {
     }
 
     private fun speak() {
-        val loaded = tts ?: return
         val text = phonemes.text.toString()
         val voice = voices.selectedItem as String
         speak.isEnabled = false
         worker.execute {
-            val track = AudioTrack.Builder()
-                .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
-                .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
-                    .setSampleRate(loaded.sampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                // Room for two chunks of 1 s: the next chunk is synthesized while
-                // the buffer plays, so the playback does not run dry between chunks.
-                .setBufferSizeInBytes(2 * loaded.sampleRate * 4)
-                .build()
             try {
-                val start = System.nanoTime()
-                var firstChunk = 0L
-                var playing = 0L
-                var samples = 0
-                var chunks = 0
-                loaded.stream(text, voice) { chunk ->
-                    if (firstChunk == 0L) firstChunk = System.nanoTime() - start
-                    samples += chunk.size
-                    chunks++
-                    // A blocking write waits for the playback, so its time is not synthesis.
-                    val before = System.nanoTime()
-                    track.write(chunk, 0, chunk.size, AudioTrack.WRITE_BLOCKING)
-                    // Starts once the first chunk is buffered, not on an empty buffer.
-                    if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
-                    playing += System.nanoTime() - before
+                if (!speakOnce(text, voice)) {
+                    // The GPU encoder produced no frames at all on this
+                    // phone: rebuild the engine on the CPU and retry once.
+                    cpuFallback = true
+                    show("GPU produced no frames, retrying on CPU…")
+                    val bundle = bundleDir
+                    if (bundle != null) {
+                        try { tts?.close() } catch (_: Exception) {}
+                        tts = HolosLiteRt(this, bundle,
+                            File(cacheDir, "holos_litert_cpu"), cpuOnly = true)
+                        speakOnce(text, voice)
+                    }
                 }
-                val synthesis = (System.nanoTime() - start - playing) / 1e9
-                val audio = samples.toDouble() / loaded.sampleRate
-                // Before the buffer runs out at the end, which counts as one more.
-                val underruns = track.underrunCount
-                show(String.format(Locale.US, "First chunk in %.0f ms, %.1f s of audio in %d chunks, RTF %.3f, underruns %d",
-                    firstChunk / 1e6, audio, chunks, synthesis / audio, underruns))
-                // Up to 2 s are still buffered, and release() would cut them off.
-                while (track.playbackHeadPosition < samples) Thread.sleep(20)
-                track.stop()
             } catch (error: Exception) {
                 show("Failed: $error")
             } finally {
-                track.release()
                 runOnUiThread { speak.isEnabled = true }
             }
+        }
+    }
+
+    /** Synthesizes and plays the text with the current engine. Returns
+     * false only when the encoder produced no frames (the GPU fallback
+     * case); other errors are thrown. */
+    private fun speakOnce(text: String, voice: String): Boolean {
+        val loaded = tts ?: return false
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+            .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                .setSampleRate(loaded.sampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            // Room for two chunks of 1 s: the next chunk is synthesized while
+            // the buffer plays, so the playback does not run dry between chunks.
+            .setBufferSizeInBytes(2 * loaded.sampleRate * 4)
+            .build()
+        try {
+            val start = System.nanoTime()
+            var firstChunk = 0L
+            var playing = 0L
+            var samples = 0
+            var chunks = 0
+            loaded.stream(text, voice) { chunk ->
+                if (firstChunk == 0L) firstChunk = System.nanoTime() - start
+                samples += chunk.size
+                chunks++
+                // A blocking write waits for the playback, so its time is not synthesis.
+                val before = System.nanoTime()
+                track.write(chunk, 0, chunk.size, AudioTrack.WRITE_BLOCKING)
+                // Starts once the first chunk is buffered, not on an empty buffer.
+                if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
+                playing += System.nanoTime() - before
+            }
+            val synthesis = (System.nanoTime() - start - playing) / 1e9
+            val audio = samples.toDouble() / loaded.sampleRate
+            // Before the buffer runs out at the end, which counts as one more.
+            val underruns = track.underrunCount
+            show(String.format(Locale.US, "First chunk in %.0f ms, %.1f s of audio in %d chunks, RTF %.3f, underruns %d",
+                firstChunk / 1e6, audio, chunks, synthesis / audio, underruns))
+            // Up to 2 s are still buffered, and release() would cut them off.
+            while (track.playbackHeadPosition < samples) Thread.sleep(20)
+            track.stop()
+            return true
+        } catch (error: Exception) {
+            val noFrames = error is IllegalArgumentException &&
+                error.message?.contains("no frames") == true
+            if (noFrames && !cpuFallback) return false
+            throw error
+        } finally {
+            track.release()
         }
     }
 
