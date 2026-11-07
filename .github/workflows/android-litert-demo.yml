@@ -1,0 +1,35 @@
+name: Build HolosTTS LiteRT demo APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'holos_litert/**'
+      - '.github/workflows/android-litert-demo.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: holos_litert/kotlin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Build LiteRT demo APK
+        run: ./gradlew :demo:assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: holos-demo-litert-debug
+          path: holos_litert/kotlin/demo/build/outputs/apk/debug/demo-debug.apk
+          if-no-files-found: error
