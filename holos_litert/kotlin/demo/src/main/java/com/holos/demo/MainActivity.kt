@@ -38,7 +38,15 @@ class MainActivity : Activity() {
     private lateinit var speak: Button
     private var tts: HolosLiteRt? = null
     private var bundleDir: File? = null
-    private var cpuFallback = false
+    private var mode: Mode = Mode.FP16_GPU
+
+    /** The engines, tried in order. The one that speaks is remembered in
+     * SharedPreferences and used first on the next launch. */
+    private enum class Mode(val label: String) {
+        FP16_GPU("FP16 GPU"),
+        FP32_GPU("FP32 GPU"),
+        CPU("CPU"),
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -82,19 +90,52 @@ class MainActivity : Activity() {
             val bundle = File(getExternalFilesDir(null), "litert")
             bundleDir = bundle
             download(bundle)
-            show("Loading the models; the first start compiles them for the GPU…")
-            val start = System.nanoTime()
-            val loaded = HolosLiteRt(this, bundle, fp16 = false)
-            tts = loaded
-            val seconds = (System.nanoTime() - start) / 1e9
-            runOnUiThread {
-                voices.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, loaded.voices)
-                speak.isEnabled = true
-                status.text = String.format(Locale.US, "Loaded FP32 GPU in %.1f s", seconds)
+            // Start from the mode that worked last time, then try the rest.
+            val saved = prefs().getString("engine_mode", null)
+                ?.let { runCatching { Mode.valueOf(it) }.getOrNull() } ?: Mode.FP16_GPU
+            val tries = listOf(saved) + Mode.values().filter { it != saved }
+            var lastError: Exception? = null
+            for (m in tries) {
+                try {
+                    show("Loading the models (${m.label}); the first start compiles them…")
+                    val start = System.nanoTime()
+                    val loaded = createEngine(m)
+                    mode = m
+                    tts = loaded
+                    val seconds = (System.nanoTime() - start) / 1e9
+                    runOnUiThread {
+                        voices.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, loaded.voices)
+                        speak.isEnabled = true
+                        status.text = String.format(Locale.US, "Loaded ${m.label} in %.1f s", seconds)
+                    }
+                    return
+                } catch (e: Exception) {
+                    lastError = e
+                }
             }
+            throw lastError ?: IllegalStateException("No engine mode worked")
         } catch (error: Exception) {
             show("Failed to load: $error")
         }
+    }
+
+    private fun prefs() = getSharedPreferences("holos_demo", MODE_PRIVATE)
+
+    private fun createEngine(m: Mode): HolosLiteRt {
+        val bundle = bundleDir ?: throw IllegalStateException("Bundle not downloaded")
+        return when (m) {
+            Mode.FP16_GPU -> HolosLiteRt(this, bundle)
+            Mode.FP32_GPU -> HolosLiteRt(this, bundle,
+                File(cacheDir, "holos_litert_fp32"), fp16 = false)
+            Mode.CPU -> HolosLiteRt(this, bundle,
+                File(cacheDir, "holos_litert_cpu"), cpuOnly = true)
+        }
+    }
+
+    private fun nextMode(m: Mode): Mode? {
+        val values = Mode.values()
+        val i = values.indexOf(m)
+        return if (i < 0 || i + 1 >= values.size) null else values[i + 1]
     }
 
     /** Downloads the bundle files that are not in the directory yet. */
@@ -189,18 +230,23 @@ class MainActivity : Activity() {
         speak.isEnabled = false
         worker.execute {
             try {
-                if (!speakOnce(text, voice)) {
-                    // The GPU encoder produced no frames at all on this
-                    // phone: rebuild the engine on the CPU and retry once.
-                    cpuFallback = true
-                    show("GPU produced no frames, retrying on CPU…")
-                    val bundle = bundleDir
-                    if (bundle != null) {
-                        try { tts?.close() } catch (_: Exception) {}
-                        tts = HolosLiteRt(this, bundle,
-                            File(cacheDir, "holos_litert_cpu"), cpuOnly = true)
-                        speakOnce(text, voice)
+                var ok = speakOnce(text, voice)
+                while (!ok) {
+                    val next = nextMode(mode) ?: break
+                    show("${mode.label} produced no frames, trying ${next.label}…")
+                    try { tts?.close() } catch (_: Exception) {}
+                    tts = createEngine(next)
+                    mode = next
+                    ok = speakOnce(text, voice)
+                }
+                if (ok) {
+                    // Remember the engine that spoke, so the next launch
+                    // starts with it instead of retrying the broken ones.
+                    if (prefs().getString("engine_mode", null) != mode.name) {
+                        prefs().edit().putString("engine_mode", mode.name).apply()
                     }
+                } else {
+                    show("Failed: the text produced no frames on every engine")
                 }
             } catch (error: Exception) {
                 show("Failed: $error")
@@ -246,8 +292,8 @@ class MainActivity : Activity() {
             val audio = samples.toDouble() / loaded.sampleRate
             // Before the buffer runs out at the end, which counts as one more.
             val underruns = track.underrunCount
-            show(String.format(Locale.US, "First chunk in %.0f ms, %.1f s of audio in %d chunks, RTF %.3f, underruns %d",
-                firstChunk / 1e6, audio, chunks, synthesis / audio, underruns))
+            show(String.format(Locale.US, "%s: first chunk in %.0f ms, %.1f s of audio in %d chunks, RTF %.3f, underruns %d",
+                mode.label, firstChunk / 1e6, audio, chunks, synthesis / audio, underruns))
             // Up to 2 s are still buffered, and release() would cut them off.
             while (track.playbackHeadPosition < samples) Thread.sleep(20)
             track.stop()
@@ -255,7 +301,7 @@ class MainActivity : Activity() {
         } catch (error: Exception) {
             val noFrames = error is IllegalArgumentException &&
                 error.message?.contains("no frames") == true
-            if (noFrames && !cpuFallback) return false
+            if (noFrames) return false
             throw error
         } finally {
             track.release()
