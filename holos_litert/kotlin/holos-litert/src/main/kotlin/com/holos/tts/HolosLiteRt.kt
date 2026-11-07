@@ -33,7 +33,9 @@ import kotlin.math.tanh
  *
  * Loading a [bundle] directory compiles the GPU programs and caches them in
  * [cacheDirectory], so later loads are faster. [fp16] = false computes in
- * FP32, slower and with no audible difference. An instance is not
+ * FP32, slower and with no audible difference. [cpuOnly] = true runs the
+ * models on the CPU instead of the GPU: slower, but it works on phones
+ * whose GPU produces no frames. An instance is not
  * thread-safe, and every call blocks until the GPU is done, so call it off
  * the main thread.
  */
@@ -42,6 +44,7 @@ class HolosLiteRt @JvmOverloads constructor(
     bundle: File,
     cacheDirectory: File = File(context.cacheDir, "holos_litert"),
     fp16: Boolean = true,
+    private val cpuOnly: Boolean = false,
 ) : AutoCloseable {
 
     /** Receives the audio chunk by chunk, as float samples at [sampleRate]. */
@@ -126,16 +129,19 @@ class HolosLiteRt @JvmOverloads constructor(
 
     private fun compile(bundle: File, stage: String, cache: File, fp16: Boolean): CompiledModel {
         val file = File(bundle, manifest.getJSONObject(stage).getString("file"))
-        val options = CompiledModel.Options(Accelerator.GPU, Accelerator.CPU)
+        val options = if (cpuOnly) CompiledModel.Options(Accelerator.CPU)
+            else CompiledModel.Options(Accelerator.GPU, Accelerator.CPU)
         val precision = if (fp16) CompiledModel.GpuOptions.Precision.FP16 else CompiledModel.GpuOptions.Precision.FP32
         // The signatures (buckets) of a stage share its weights on the GPU. The
         // cache key changes with the file, so a new bundle is compiled again.
         val cacheKey = "${file.name}_${file.length()}_${file.lastModified()}_$precision"
-        options.gpuOptions = CompiledModel.GpuOptions(
-            true, null, null, precision, null, null,
-            cache.absolutePath, cacheKey, true, null,
-            null, null, CompiledModel.GpuOptions.Backend.OPENCL, null, null,
-        )
+        if (!cpuOnly) {
+            options.gpuOptions = CompiledModel.GpuOptions(
+                true, null, null, precision, null, null,
+                cache.absolutePath, cacheKey, true, null,
+                null, null, CompiledModel.GpuOptions.Backend.OPENCL, null, null,
+            )
+        }
         return CompiledModel.create(file.absolutePath, options, environment)
     }
 
