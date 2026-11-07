@@ -84,13 +84,13 @@ class MainActivity : Activity() {
             download(bundle)
             show("Loading the models; the first start compiles them for the GPU…")
             val start = System.nanoTime()
-            val loaded = HolosLiteRt(this, bundle)
+            val loaded = HolosLiteRt(this, bundle, fp16 = false)
             tts = loaded
             val seconds = (System.nanoTime() - start) / 1e9
             runOnUiThread {
                 voices.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, loaded.voices)
                 speak.isEnabled = true
-                status.text = String.format(Locale.US, "Loaded in %.1f s", seconds)
+                status.text = String.format(Locale.US, "Loaded FP32 GPU in %.1f s", seconds)
             }
         } catch (error: Exception) {
             show("Failed to load: $error")
